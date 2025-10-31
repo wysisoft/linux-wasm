@@ -4,6 +4,12 @@
   <meta charset="utf-8">
   <!-- SPDX-License-Identifier: GPL-2.0-only -->
 
+  <!-- Stupid workaround to trick the browser it gets COOP/COEP headers, enabling window.crossOriginIsolated. -->
+  <!-- Needed when serving this site using GitHub Pages as it does not set the headers we want. -->
+  <!-- Read more: https://github.com/gzuidhof/coi-serviceworker -->
+  <script>window.coi = {coepCredentialless: () => false};</script>
+  <script src="coi-serviceworker.min.js"></script>
+
   <script>
     // Append ?v=-1 to the URL to cache-bust smug browsers that ignore your Cache-Control headers.
     let wasm_linux_version = parseInt(new URLSearchParams(document.location.search).get("v") || 1);
