@@ -67,11 +67,7 @@ const linux = async (worker_url, vmlinux, boot_cmdline, initrd, log, console_wri
     },
 
     release_task: (message) => {
-      // Stop the worker, which will stop script execution. This is safe as the task should be hanging on a lock waiting
-      // to be scheduled - which never happens as dead tasks don't get ever get scheduled.
-      tasks[message.dead_task].worker.terminate();
-
-      delete tasks[message.dead_task];
+      kill_task(message.dead_task);
     },
 
     serialize_tasks: (message) => {
@@ -80,8 +76,16 @@ const linux = async (worker_url, vmlinux, boot_cmdline, initrd, log, console_wri
       // Tell the next task where we switched from, so that it can finish the task switch.
       tasks[message.next_task].last_task[0] = message.prev_task;
 
+      tasks[message.prev_task].running = false;
+      tasks[message.next_task].running = true;
+
       // Release the above write of last_task and wake up the task.
       lock_notify(tasks[message.next_task].locks, "serialize");
+
+      // In case the task was dying, we're now done. prev_task will wait in serialize_me() but never be scheduled again.
+      if (tasks[message.prev_task].kill) {
+        kill_task(message.prev_task);
+      }
     },
 
     console_read: (message, worker) => {
@@ -161,6 +165,23 @@ const linux = async (worker_url, vmlinux, boot_cmdline, initrd, log, console_wri
     tasks[new_task] = make_vmlinux_runner(name + " (" + new_task + ")", options);
   };
 
+  const kill_task = (dead_task) => {
+    const task = tasks[dead_task];
+    if (task.running) {
+      // Case 1: current task is killing itself => we know that the reaped task is currently running (probably kthread).
+      //
+      // We need to delay killing the worker as it's still running. There is still some code for it to run, and
+      // importantly, it needs to notify the next task to run on the CPU in serialize_me(). If the worker was
+      // terminated before it was scheduled out, the dead task could deadlock its CPU on tasks[???].locks["serialize"].
+      task.kill = true;
+    } else {
+      // Case 2: current task reaped another task => we know that the reaped task is not running. (kill == false).
+      // Case 3: we get here from Case 1 as it eventually scheduled out, calling serialize_me(). (kill == true).
+      task.worker.terminate();
+      delete tasks[dead_task];
+    }
+  };
+
   /// Create a runner for vmlinux. It will run in a Web Worker and execute some specified code.
   const make_vmlinux_runner = (name, options) => {
     // Note: SharedWorker does not seem to allow WebAssembly Module or Memory instances posted.
@@ -202,6 +223,8 @@ const linux = async (worker_url, vmlinux, boot_cmdline, initrd, log, console_wri
       worker: worker,
       locks: locks,
       last_task: last_task,
+      running: true,
+      kill: false,
     };
   };
 
