@@ -20,15 +20,33 @@ def rewrite_triple(original_args):
         raise RuntimeError(f"unknown -march= specified: {arch}")
 
     args = []
+    triple_os = "none"
+    triple_abi = "none"
     for arg in original_args:
         if arg.startswith("--target="):
             args.append(f"--target={arch}-unknown-unknown")
+
+            if "-linux-" in arg or arg.endswith("-linux"):
+                triple_os = "linux"
+
+            if arg.endswith("-gnu"):
+                triple_abi = "gnu"
+            elif arg.endswith("-musl"):
+                triple_abi = "musl"
 
         elif arg.startswith("-march="):
             pass  # Drop any -march=*.
 
         else:
             args.append(arg)
+
+    if triple_os == "linux":
+        args.append("-D__linux__")
+        args.append("-D__unix__")
+        args.append("-D__unix")
+
+    if triple_abi == "gnu":
+        args.append("-D__gnu_linux__")
 
     return args, arch
 
