@@ -178,7 +178,13 @@ case "$1" in # note use of ;;& meaning that each case is re-tested (can hit mult
             elif [ "$LW_KERNEL_CONFIG" == "kunit" ]; then
                 $LW_KERNEL_MAKE "${LW_VARIANT}_defconfig" ../../../tools/testing/kunit/configs/all_tests.config
 
-                # These tests are probably OK but take a very long time to complete and also overflow the kernel log.
+                # Allow reading full results without truncation (kernel log may overflow):
+                # mount -t debugfs none /sys/kernel/debug
+                # grep "not ok" /sys/kernel/debug/kunit/*/results
+                $LW_KERNEL_MOD_CONFIG "$LW_BUILD_KERNEL/.config" --enable CONFIG_DEBUG_FS
+                $LW_KERNEL_MOD_CONFIG "$LW_BUILD_KERNEL/.config" --enable CONFIG_KUNIT_DEBUGFS
+
+                # These tests are OK but take a very long time to complete.
                 $LW_KERNEL_MOD_CONFIG "$LW_BUILD_KERNEL/.config" --undefine CONFIG_SND_SOC
 
                 $LW_KERNEL_MAKE olddefconfig
