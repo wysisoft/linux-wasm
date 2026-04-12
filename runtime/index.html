@@ -33,7 +33,7 @@
 
         // Boot on 3 CPUs, we will bring up more later on as needed.
         const boot_cmdline =
-          "maxcpus=3 nohz_full=0,2-63 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0";
+          "maxcpus=3 nohz_full=0,2-63 rcu_nocbs=0,2-63 root=/dev/ram0 rootfstype=ramfs init=/init console=hvc console=ttyS0";
 
         const initrd_request = await fetch("initramfs.cpio.gz?v=" + wasm_linux_version);
         if (!initrd_request.ok) {
