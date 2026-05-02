@@ -1,4 +1,4 @@
-From 38a1f11a90de225b593035ddf8ff9ec3cefa67ff Mon Sep 17 00:00:00 2001
+From 57144b2d8d5fb86844ffd797993be77361af8f4d Mon Sep 17 00:00:00 2001
 From: Joel Severin <joel.severin@icemanor.se>
 Date: Mon, 13 May 2024 23:44:37 +0200
 Subject: [PATCH] NOMERGE: Hacks to build Wasm/Linux arch (minimal and
@@ -14,13 +14,13 @@ Subject: [PATCH] NOMERGE: Hacks to build Wasm/Linux arch (minimal and
  configs/wasm_defconfig                   | 1231 ++++++++++++++++++++++
  coreutils/test.c                         |    6 +-
  editors/vi.c                             |    3 +
- init/init.c                              |   37 +-
+ init/init.c                              |   52 +-
  scripts/Makefile.build                   |    2 +-
  scripts/gcc-version.sh                   |    3 +
  scripts/trylink                          |    6 +-
  shell/hush.c                             |  137 ++-
  util-linux/fdisk.c                       |    6 -
- 15 files changed, 1391 insertions(+), 129 deletions(-)
+ 15 files changed, 1401 insertions(+), 134 deletions(-)
  create mode 100644 arch/wasm/Makefile
  create mode 100644 configs/wasm_defconfig
 
@@ -1518,7 +1518,7 @@ index 2645afe..2f389d7 100644
  
  	cmd_mode = 0;		// 0=command  1=insert  2='R'eplace
 diff --git a/init/init.c b/init/init.c
-index 1e1ce83..0cf6da4 100644
+index 1e1ce83..8862f1c 100644
 --- a/init/init.c
 +++ b/init/init.c
 @@ -135,6 +135,7 @@
@@ -1580,6 +1580,35 @@ index 1e1ce83..0cf6da4 100644
  static struct init_action *mark_terminated(pid_t pid)
  {
  	struct init_action *a;
+@@ -730,6 +737,14 @@ static void parse_inittab(void)
+ #endif
+ }
+ 
++static int pause_and_low_level_reboot_child(void* data) NORETURN;
++static int pause_and_low_level_reboot_child(void* data)
++{
++	reboot(*(unsigned*)data);
++	_exit_SUCCESS();
++	return 0;
++}
++
+ static void pause_and_low_level_reboot(unsigned magic) NORETURN;
+ static void pause_and_low_level_reboot(unsigned magic)
+ {
+@@ -741,11 +756,8 @@ static void pause_and_low_level_reboot(unsigned magic)
+ 	/* We have to fork here, since the kernel calls do_exit(EXIT_SUCCESS)
+ 	 * in linux/kernel/sys.c, which can cause the machine to panic when
+ 	 * the init process exits... */
+-	pid = vfork();
+-	if (pid == 0) { /* child */
+-		reboot(magic);
+-		_exit_SUCCESS();
+-	}
++	pid = clone(pause_and_low_level_reboot_child, NULL, CLONE_VM | CLONE_VFORK | SIGCHLD, &magic);
++
+ 	/* Used to have "while (1) sleep(1)" here.
+ 	 * However, in containers reboot() call is ignored, and with that loop
+ 	 * we would eternally sleep here - not what we want.
 diff --git a/scripts/Makefile.build b/scripts/Makefile.build
 index 5eac45f..5dea130 100644
 --- a/scripts/Makefile.build
