@@ -171,6 +171,9 @@ case "$1" in # note use of ;;& meaning that each case is re-tested (can hit mult
             elif [ "$LW_KERNEL_CONFIG" == "no" ]; then
                 KCONFIG_ALLCONFIG="$LW_SRC/kernel/arch/wasm/configs/$LW_ARCH.config" \
                     $LW_KERNEL_MAKE allnoconfig
+
+                # Not allnoconfig but quite essential info in the context of arch debugging.
+                $LW_KERNEL_MOD_CONFIG "$LW_BUILD_KERNEL/.config" --enable CONFIG_WERROR
             elif [ "$LW_KERNEL_CONFIG" == "dev" ]; then
                 $LW_KERNEL_MAKE "${LW_VARIANT}_defconfig"
                 $LW_KERNEL_MOD_CONFIG "$LW_BUILD_KERNEL/.config" --enable CONFIG_WERROR
