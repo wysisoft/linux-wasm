@@ -57,6 +57,7 @@ case "$1" in # note use of ;;& meaning that each case is re-tested (can hit mult
         mkdir -p "$LW_SRC/kernel"
         git clone -b wasm-7.0 --single-branch --no-tags https://github.com/joelseverin/linux.git "$LW_SRC/kernel"
         git -C "$LW_SRC/kernel" fetch --deepen=1 --no-tags
+        git -C "$LW_SRC/kernel" am < "$LW_ROOT/patches/kernel/0001-binfmt_node.patch"
     handled=1;;&
 
     "fetch-musl"|"all-musl"|"fetch"|"all")
@@ -292,6 +293,12 @@ case "$1" in # note use of ;;& meaning that each case is re-tested (can hit mult
             cd "$LW_ROOT/patches/initramfs/"
             # The below command must run in the same directory as the root of the files it will copy.
             echo "./init" | cpio -ov --format=newc -A -O "$LW_INSTALL/initramfs-$LW_VARIANT/initramfs.cpio"
+        )
+
+        # Copy sample JavaScript node programs.
+        (
+            cd "$LW_ROOT/patches/initramfs/"
+            find . -name '*.js' -print0 | cpio --null -ov --format=newc -A -O "$LW_INSTALL/initramfs-$LW_VARIANT/initramfs.cpio"
         )
 
         # Finally we should zip it up so that it takes less space. This is the file to distribute.

@@ -1,0 +1,372 @@
+diff --git a/arch/wasm/configs/base.config b/arch/wasm/configs/base.config
+index 02359de73323..2a64f9ed292a 100644
+--- a/arch/wasm/configs/base.config
++++ b/arch/wasm/configs/base.config
+@@ -10,6 +10,7 @@ CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
+ CONFIG_BLK_DEV_INITRD=y
+ CONFIG_BINFMT_SCRIPT=y
+ CONFIG_BINFMT_WASM=y
++CONFIG_BINFMT_NODE=y
+ CONFIG_TTY=y
+ CONFIG_HVC_WASM=y
+ CONFIG_NO_HZ_FULL=y
+diff --git a/arch/wasm/configs/wasm32_nommu_defconfig b/arch/wasm/configs/wasm32_nommu_defconfig
+index 52b34d131463..87a33bb5c7b9 100644
+--- a/arch/wasm/configs/wasm32_nommu_defconfig
++++ b/arch/wasm/configs/wasm32_nommu_defconfig
+@@ -11,6 +11,7 @@ CONFIG_EXPERT=y
+ CONFIG_HVC_WASM=y
+ # CONFIG_COMPAT_32BIT_TIME is not set
+ CONFIG_BINFMT_WASM=y
++CONFIG_BINFMT_NODE=y
+ # CONFIG_COREDUMP is not set
+ # CONFIG_COMPAT_BRK is not set
+ # CONFIG_VM_EVENT_COUNTERS is not set
+diff --git a/arch/wasm/configs/wasm64_nommu_defconfig b/arch/wasm/configs/wasm64_nommu_defconfig
+index e03c984ef220..0c14f40feda2 100644
+--- a/arch/wasm/configs/wasm64_nommu_defconfig
++++ b/arch/wasm/configs/wasm64_nommu_defconfig
+@@ -11,6 +11,7 @@ CONFIG_EXPERT=y
+ CONFIG_64BIT=y
+ CONFIG_HVC_WASM=y
+ CONFIG_BINFMT_WASM=y
++CONFIG_BINFMT_NODE=y
+ # CONFIG_COREDUMP is not set
+ # CONFIG_COMPAT_BRK is not set
+ # CONFIG_VM_EVENT_COUNTERS is not set
+diff --git a/arch/wasm/include/asm/wasm.h b/arch/wasm/include/asm/wasm.h
+index 36fd7b70c181..43b0bb5e0ed8 100644
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -21,8 +21,15 @@ extern struct task_struct *wasm_serialize_tasks(struct task_struct *prev_task,
+ 
+ extern void wasm_load_executable(unsigned long bin_start, unsigned long bin_end,
+ 	unsigned long data_start, unsigned long table_start);
++extern void wasm_load_js_executable(unsigned long source_start,
++	unsigned long source_len, unsigned long stack_pointer,
++	unsigned long data_start);
+ extern void wasm_reload_program(void);
+ 
+ extern void wasm_clone_callback(void);
+ 
++extern void start_thread_js(struct pt_regs *regs, unsigned long stack_pointer,
++	unsigned long source_start, unsigned long source_end,
++	unsigned long data_start);
++
+ #endif /* _ASM_WASM_WASM_H */
+diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
+index 2f7a4df6ad4e..c0f3ea3fb9d6 100644
+--- a/arch/wasm/kernel/process.c
++++ b/arch/wasm/kernel/process.c
+@@ -246,6 +246,24 @@ void start_thread(struct pt_regs *regs, unsigned long stack_pointer)
+ 	current_thread_info()->flags |= _TIF_RELOAD_PROGRAM;
+ }
+ 
++/*
++ * Set up a thread for executing a JavaScript "node" program in the Wasm host.
++ */
++void start_thread_js(struct pt_regs *regs, unsigned long stack_pointer,
++		     unsigned long source_start, unsigned long source_end,
++		     unsigned long data_start)
++{
++	memset(regs, 0, sizeof(*regs));
++	regs->stack_pointer = stack_pointer;
++	regs->cpuflags = CPUFLAGS_USER_TASK_DEFAULT;
++
++	wasm_load_js_executable(source_start, source_end - source_start,
++		stack_pointer, data_start);
++
++	/* Reload the program when the current syscall exits. */
++	current_thread_info()->flags |= _TIF_RELOAD_PROGRAM;
++}
++
+ void release_thread(struct task_struct *dead_task)
+ {
+ 	/* TODO: This code also needs review, like user_task_set_affinity(). */
+diff --git a/fs/Kconfig.binfmt b/fs/Kconfig.binfmt
+index 4445adb2d73f..083409a42e1d 100644
+--- a/fs/Kconfig.binfmt
++++ b/fs/Kconfig.binfmt
+@@ -151,6 +151,14 @@ config BINFMT_WASM
+ 	help
+ 	  Support WebAssembly format binaries.
+ 
++config BINFMT_NODE
++	bool "Kernel support for JavaScript node processes"
++	depends on ARCH_HAS_BINFMT_WASM
++	help
++	  Support JavaScript processes that run directly in the Wasm host
++	  instead of as a Wasm binary. JavaScript source files are recognized
++	  by a '#!/...node' shebang line.
++
+ config BINFMT_MISC
+ 	tristate "Kernel support for MISC binaries"
+ 	help
+diff --git a/fs/Makefile b/fs/Makefile
+index 393d14e9a1b1..bcd650e215f0 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -40,6 +40,7 @@ obj-$(CONFIG_COMPAT_BINFMT_ELF)	+= compat_binfmt_elf.o
+ obj-$(CONFIG_BINFMT_ELF_FDPIC)	+= binfmt_elf_fdpic.o
+ obj-$(CONFIG_BINFMT_FLAT)	+= binfmt_flat.o
+ obj-$(CONFIG_BINFMT_WASM)	+= binfmt_wasm.o
++obj-$(CONFIG_BINFMT_NODE)	+= binfmt_node.o
+ 
+ obj-$(CONFIG_FS_STACK)		+= backing-file.o
+ obj-$(CONFIG_FS_MBCACHE)	+= mbcache.o
+diff --git a/fs/binfmt_node.c b/fs/binfmt_node.c
+new file mode 100644
+index 000000000000..e15c72034fbf
+--- /dev/null
++++ b/fs/binfmt_node.c
+@@ -0,0 +1,250 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Binary format for JavaScript "node" processes running in the Wasm host. */
++
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/sched/task_stack.h>
++#include <linux/mm.h>
++#include <linux/mman.h>
++#include <linux/errno.h>
++#include <linux/signal.h>
++#include <linux/string.h>
++#include <linux/fs.h>
++#include <linux/file.h>
++#include <linux/ptrace.h>
++#include <linux/user.h>
++#include <linux/slab.h>
++#include <linux/binfmts.h>
++#include <linux/personality.h>
++#include <linux/init.h>
++#include <linux/uaccess.h>
++#include <linux/vmalloc.h>
++#include <asm/wasm.h>
++
++#define NODE_STACK_SIZE		(2UL * PAGE_SIZE)
++#define NODE_STACK_ALIGN	PAGE_SIZE
++#define NODE_DATA_SIZE		(64UL * PAGE_SIZE)
++
++/*
++ * Parse the env- and arg-strings in new user memory and create the pointer
++ * tables from them, and put their addresses on the "stack", recording the new
++ * stack pointer value. Based on create_wasm_tables() in binfmt_wasm.c.
++ */
++static int create_node_tables(struct linux_binprm *bprm, unsigned long arg_start)
++{
++	char __user *p;
++	unsigned long __user *sp;
++	long i, len;
++	const struct cred *cred = current_cred();
++
++	const unsigned long node_auxv[] = {
++		AT_NOTELF, 1UL,
++		AT_PAGESZ, PAGE_SIZE,
++		AT_UID, from_kuid_munged(cred->user_ns, cred->uid),
++		AT_EUID, from_kuid_munged(cred->user_ns, cred->euid),
++		AT_GID, from_kgid_munged(cred->user_ns, cred->gid),
++		AT_EGID, from_kgid_munged(cred->user_ns, cred->gid),
++		AT_SECURE, bprm->secureexec,
++		AT_NULL, 0UL /* end */
++	};
++
++	p = (char __user *)arg_start;
++	sp = (unsigned long __user *)current->mm->start_stack;
++
++	sp -= (sizeof(node_auxv) + (sizeof(unsigned long) - 1U)) /
++		sizeof(unsigned long);
++	sp -= bprm->envc + 1;
++	sp -= bprm->argc + 1;
++	sp -= 1; /* &argc */
++
++	current->mm->start_stack = (unsigned long)sp & -NODE_STACK_ALIGN;
++	sp = (unsigned long __user *)current->mm->start_stack;
++
++	if (put_user(bprm->argc, sp++))
++		return -EFAULT;
++
++	current->mm->arg_start = (unsigned long)p;
++	for (i = bprm->argc; i > 0; i--) {
++		if (put_user((unsigned long)p, sp++))
++			return -EFAULT;
++		len = strnlen_user(p, MAX_ARG_STRLEN);
++		if (!len || len > MAX_ARG_STRLEN)
++			return -EINVAL;
++		p += len;
++	}
++	if (put_user(0, sp++))
++		return -EFAULT;
++	current->mm->arg_end = (unsigned long)p;
++
++	current->mm->env_start = (unsigned long)p;
++	for (i = bprm->envc; i > 0; i--) {
++		if (put_user((unsigned long)p, sp++))
++			return -EFAULT;
++		len = strnlen_user(p, MAX_ARG_STRLEN);
++		if (!len || len > MAX_ARG_STRLEN)
++			return -EINVAL;
++		p += len;
++	}
++	if (put_user(0, sp++))
++		return -EFAULT;
++	current->mm->env_end = (unsigned long)p;
++
++	memcpy(sp, node_auxv, sizeof(node_auxv));
++
++	return 0;
++}
++
++static bool is_node_binary(struct linux_binprm *bprm)
++{
++	const char *buf = bprm->buf;
++
++	/* Accept scripts that explicitly ask for the node interpreter. */
++	if (buf[0] == '#' && buf[1] == '!') {
++		const char *p = memchr(buf, '\n', BINPRM_BUF_SIZE);
++		size_t line_len = p ? (size_t)(p - buf) : BINPRM_BUF_SIZE;
++
++		if (strnstr(buf, "node", line_len))
++			return true;
++	}
++
++	return false;
++}
++
++static int load_node_file(struct linux_binprm *bprm, unsigned long extra_stack)
++{
++	unsigned long source_start;
++	unsigned long source_size;
++	unsigned long stack_size;
++	unsigned long data_start = 0;
++	unsigned long data_size = NODE_DATA_SIZE;
++	loff_t source_size_ll;
++	int ret;
++
++	source_size_ll = i_size_read(file_inode(bprm->file));
++	if (sizeof(long) < sizeof(loff_t) && source_size_ll > (loff_t)ULONG_MAX)
++		return -ENOMEM;
++
++	source_size = (unsigned long)source_size_ll;
++
++	ret = begin_new_exec(bprm);
++	if (ret)
++		return ret;
++
++	set_personality(PER_LINUX_32BIT);
++	setup_new_exec(bprm);
++
++	/*
++	 * Map the source file read-only. The host reads the JS text from this
++	 * region via the shared Wasm memory.
++	 */
++	source_start = vm_mmap(bprm->file, 0, source_size,
++			PROT_READ, MAP_PRIVATE, 0);
++	if (!source_start || IS_ERR_VALUE(source_start)) {
++		ret = source_start ? (int)source_start : -ENOMEM;
++		pr_err("Unable to mmap JS source, errno: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * Small data region for the JS process. The host may use this as a
++	 * simple heap for string/buffer allocations.
++	 */
++	data_start = vm_mmap(NULL, 0, data_size,
++			PROT_READ | PROT_WRITE,
++			MAP_PRIVATE | MAP_ANONYMOUS, 0);
++	if (!data_start || IS_ERR_VALUE(data_start)) {
++		ret = data_start ? (int)data_start : -ENOMEM;
++		pr_err("Unable to allocate data for node process, errno: %d\n", ret);
++		goto out_unmap_source;
++	}
++
++	/*
++	 * Create a stack, and put the brk at the start of this area.
++	 */
++	stack_size = PAGE_ALIGN(NODE_STACK_SIZE + extra_stack);
++	current->mm->start_brk = vm_mmap(NULL, 0, stack_size,
++			PROT_READ | PROT_WRITE,
++			MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, 0);
++	if (!current->mm->start_brk || IS_ERR_VALUE(current->mm->start_brk)) {
++		ret = current->mm->start_brk ?
++			(int)current->mm->start_brk : -ENOMEM;
++		pr_err("Unable to allocate stack for node process, errno: %d\n", ret);
++		current->mm->start_brk = 0;
++		goto out_unmap_data;
++	}
++	current->mm->brk = current->mm->start_brk;
++#ifndef CONFIG_MMU
++	current->mm->context.end_brk = current->mm->start_brk + stack_size;
++#endif
++	current->mm->start_stack = current->mm->start_brk + stack_size;
++
++	current->mm->start_code = source_start;
++	current->mm->end_code = source_start + source_size;
++	current->mm->start_data = data_start;
++	current->mm->end_data = data_start + data_size;
++
++	return 0;
++
++out_unmap_data:
++	vm_munmap(data_start, data_size);
++out_unmap_source:
++	vm_munmap(source_start, source_size);
++	return ret;
++}
++
++static int load_node_binary(struct linux_binprm *bprm);
++
++static struct linux_binfmt node_format = {
++	.module		= THIS_MODULE,
++	.load_binary	= load_node_binary,
++};
++
++static int load_node_binary(struct linux_binprm *bprm)
++{
++	struct pt_regs *regs = current_pt_regs();
++	unsigned long extra_stack = 0;
++	int res;
++
++	if (!is_node_binary(bprm))
++		return -ENOEXEC;
++
++#ifndef CONFIG_MMU
++	extra_stack += PAGE_SIZE * MAX_ARG_PAGES - bprm->p;
++#endif
++	extra_stack += (bprm->argc + 1) * sizeof(char *);
++	extra_stack += (bprm->envc + 1) * sizeof(char *);
++	extra_stack = ALIGN(extra_stack, NODE_STACK_ALIGN);
++
++	res = load_node_file(bprm, extra_stack);
++	if (res < 0)
++		return res;
++
++	set_binfmt(&node_format);
++
++#ifdef CONFIG_MMU
++	res = setup_arg_pages(bprm, STACK_TOP, EXSTACK_DEFAULT);
++	if (!res)
++		res = create_node_tables(bprm, bprm->p);
++#else
++	res = transfer_args_to_stack(bprm, &current->mm->start_stack);
++	if (!res)
++		res = create_node_tables(bprm, current->mm->start_stack);
++#endif
++	if (res)
++		return res;
++
++	finalize_exec(bprm);
++	start_thread_js(regs, current->mm->start_stack,
++			current->mm->start_code,
++			current->mm->end_code,
++			current->mm->start_data);
++
++	return 0;
++}
++
++static int __init init_node_binfmt(void)
++{
++	register_binfmt(&node_format);
++	return 0;
++}
++core_initcall(init_node_binfmt);

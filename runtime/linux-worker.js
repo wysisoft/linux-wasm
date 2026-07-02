@@ -27,6 +27,14 @@
   let user_executable_instance = null;
   let user_executable_imports = null;
 
+  /// The JS source for a "node" process (if any).
+  let js_executable_source = null;
+  let js_executable_stack_pointer = 0;
+  let js_executable_data_start = 0;
+
+  /// Flag indicating this runner executes JS instead of a user Wasm module.
+  let is_js_runner = false;
+
   /// Flag that a clone callback should be called instead of _start().
   let should_call_clone_callback = false;
 
@@ -165,6 +173,18 @@
       // kernel exits back to userland, which will termintate the user executable with a Trap.
       user_executable_instance = null;
       user_executable_imports = null;
+      is_js_runner = false;
+    },
+
+    wasm_load_js_executable: (source_start, source_len, stack_pointer, data_start) => {
+      js_executable_source = new Uint8Array(memory.buffer).slice(source_start, source_start + source_len);
+      js_executable_stack_pointer = stack_pointer;
+      js_executable_data_start = data_start;
+
+      user_executable = null;
+      user_executable_instance = null;
+      user_executable_imports = null;
+      is_js_runner = true;
     },
 
     /// Handle user mode return (e.g. from syscall) that should not proceed normally. (Not called on normal returns.)
@@ -503,12 +523,12 @@
         }
       };
 
-      const user_executable_error = (error) => {
+      const executable_error = (error) => {
         if (error instanceof Trap) {
           if (error.kind == "reload_program") {
             // Someone called exec and the currently executing code should stop. We should run the new user code already
-            // loaded by wasm_load_executable().
-            return user_executable_chain();
+            // loaded by wasm_load_executable() or wasm_load_js_executable().
+            return run_chain();
           } else if (error.kind == "panic") {
             // This has already been handled - just swallow it. This Worker will be done - but kept for later debugging.
           } else {
@@ -519,15 +539,127 @@
         }
       };
 
-      const user_executable_chain = () => {
-        // user_executable_error() may deal with an exec() trap and recursively call run_chain() again.
-        return user_executable_setup().then(user_executable_run).catch(user_executable_error);
+      const js_executable_setup = () => {
+        const source_text = text_decoder.decode(js_executable_source);
+        const stack_pointer = js_executable_stack_pointer;
+        const data_start = js_executable_data_start;
+        const data_size = 64 * 4096; /* matches NODE_DATA_SIZE */
+        const data_end = data_start + data_size;
+        let heap_ptr = data_start;
+
+        const u8_view = () => new Uint8Array(memory.buffer);
+        const u32_view = () => new Uint32Array(memory.buffer);
+
+        const read_cstring = (ptr) => {
+          const u8 = u8_view();
+          let end = Number(ptr);
+          while (u8[end]) end++;
+          return text_decoder.decode(u8.slice(Number(ptr), end));
+        };
+
+        // Parse argc/argv/envp from the initial stack layout built by binfmt_node.c.
+        const argc = u32_view()[Number(stack_pointer) / 4];
+        let p = Number(stack_pointer) / 4 + 1;
+        const argv = [];
+        for (let i = 0; i < argc; i++) {
+          argv.push(read_cstring(u32_view()[p++]));
+        }
+        p++; // skip null terminator of argv
+        const environ = {};
+        while (u32_view()[p]) {
+          const env = read_cstring(u32_view()[p++]);
+          const eq = env.indexOf('=');
+          if (eq >= 0) environ[env.slice(0, eq)] = env.slice(eq + 1);
+        }
+
+        const syscall = (nr, ...args) => {
+          const nargs = args.length;
+          if (nargs > 6) throw new Error("Too many syscall arguments");
+          const fn = vmlinux_instance.exports["wasm_syscall_" + nargs];
+          if (!fn) throw new Error("Unsupported syscall arity: " + nargs);
+          const sp = (arch_bits == 64) ? BigInt(stack_pointer) : stack_pointer;
+          const tp = (arch_bits == 64) ? 0n : 0;
+          let result = fn(sp, tp, nr, ...args);
+          if (arch_bits == 64 && typeof result === "bigint") result = Number(result);
+          return result;
+        };
+
+        const alloc = (size) => {
+          const aligned = (size + 7) & ~7;
+          if (heap_ptr + aligned > data_end) return 0;
+          const ptr = heap_ptr;
+          heap_ptr += aligned;
+          return ptr;
+        };
+
+        const free = (ptr) => {
+          /* No-op for the simple bump allocator. */
+        };
+
+        const os = {
+          syscall,
+          argv,
+          environ,
+          alloc,
+          free,
+          readString: read_cstring,
+          writeString: (ptr, str) => {
+            const enc = text_encoder.encode(str);
+            const u8 = u8_view();
+            u8.set(enc, Number(ptr));
+            u8[Number(ptr) + enc.length] = 0;
+            return enc.length;
+          },
+          readBytes: (ptr, len) => u8_view().slice(Number(ptr), Number(ptr) + len),
+          writeBytes: (ptr, bytes) => u8_view().set(bytes, Number(ptr)),
+          memory,
+          u8: u8_view,
+          u32: u32_view,
+          stackPointer: stack_pointer,
+          dataStart: data_start,
+          // Common syscall numbers from asm-generic/unistd.h
+          SYS_exit: 93,
+          SYS_exit_group: 94,
+          SYS_read: 63,
+          SYS_write: 64,
+          SYS_openat: 56,
+          SYS_close: 57,
+          SYS_mmap: 222,
+          SYS_munmap: 215,
+          SYS_brk: 214,
+          SYS_getpid: 172,
+          SYS_getuid: 174,
+          SYS_geteuid: 175,
+          SYS_getgid: 176,
+          SYS_getegid: 177,
+          SYS_nanosleep: 101,
+          SYS_clock_gettime: 113,
+        };
+
+        self.os = os;
+        return Promise.resolve({ source_text, os });
+      };
+
+      const js_executable_run = ({ source_text, os }) => {
+        const fn = new Function(source_text + "\n//# sourceURL=node-process.js\n");
+        fn();
+        // If the script returns, exit cleanly.
+        os.syscall(os.SYS_exit, 0);
+        throw new Error("JS process did not exit");
+      };
+
+      const run_chain = () => {
+        // executable_error() may deal with an exec() trap and recursively call run_chain() again.
+        if (is_js_runner) {
+          return js_executable_setup().then(js_executable_run).catch(executable_error);
+        }
+        return user_executable_setup().then(user_executable_run).catch(executable_error);
       };
 
       // All tasks start in the kernel, some return to userland, where they should never return. If they return, we
       // handle this as an error and wait. Our life ends when the kernel kills us by terminating the whole Worker. Oh,
       // and exex() can trap us, in which case we have to circle back to loading new user code and executing it agian.
-      vmlinux_setup().then(vmlinux_run).catch(wasm_error).then(user_executable_chain);
+      vmlinux_setup().then(vmlinux_run).catch(wasm_error).then(run_chain);
     },
   };
 

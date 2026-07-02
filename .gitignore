@@ -1,3 +1,4 @@
 /*workspace*/
 /runtime/vmlinux*.wasm
 /runtime/initramfs*.cpio.gz
+.venv/
