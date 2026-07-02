@@ -55,7 +55,7 @@ case "$1" in # note use of ;;& meaning that each case is re-tested (can hit mult
 
     "fetch-kernel"|"all-kernel"|"fetch"|"all")
         mkdir -p "$LW_SRC/kernel"
-        git clone -b wasm-7.0 --shallow-exclude=v7.0 --single-branch --no-tags https://github.com/joelseverin/linux.git "$LW_SRC/kernel"
+        git clone -b wasm-7.0 --single-branch --no-tags https://github.com/joelseverin/linux.git "$LW_SRC/kernel"
         git -C "$LW_SRC/kernel" fetch --deepen=1 --no-tags
     handled=1;;&
 
@@ -101,8 +101,8 @@ case "$1" in # note use of ;;& meaning that each case is re-tested (can hit mult
                 -DCOMPILER_RT_DEFAULT_TARGET_ONLY=Yes \
                 -DLLVM_DEFAULT_TARGET_TRIPLE="wasm32-unknown-unknown" \
             -DLLVM_ENABLE_ASSERTIONS=1 \
-            -DLLVM_PARALLEL_LINK_JOBS=$LW_JOBS_LLVM_LINK \
-            -DLLVM_PARALLEL_COMPILE_JOBS=$LW_JOBS_LLVM_COMPILE \
+            -DLLVM_PARALLEL_LINK_JOBS=2 \
+            -DLLVM_PARALLEL_COMPILE_JOBS=2 \
             "$LW_SRC/llvm/llvm"
 
         cmake --build "$LW_BUILD/llvm"
